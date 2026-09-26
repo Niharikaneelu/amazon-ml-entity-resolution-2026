@@ -1,0 +1,29 @@
+# Dataset
+dataset/*.tsv
+dataset/**/*.tsv
+
+# Generated outputs
+output/*.tsv
+output/*.csv
+output/*.parquet
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Models
+*.pkl
+*.joblib
+*.model
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
