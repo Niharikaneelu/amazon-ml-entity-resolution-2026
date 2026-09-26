@@ -1,6 +1,9 @@
 # Dataset
 dataset/*.tsv
 dataset/**/*.tsv
+*.zip
+6ab10eb3b23ba_student_resource/
+
 
 # Generated outputs
 output/*.tsv
