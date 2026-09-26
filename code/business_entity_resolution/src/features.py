@@ -1,10 +1,12 @@
-from difflib import SequenceMatcher
-
 import pandas as pd
 
-
 def _similarity(left: object, right: object) -> float:
-    return SequenceMatcher(None, str(left), str(right)).ratio()
+    set1 = set(str(left).lower().split())
+    set2 = set(str(right).lower().split())
+    if not set1 and not set2:
+        return 1.0
+    union_len = len(set1 | set2)
+    return len(set1 & set2) / union_len if union_len > 0 else 0.0
 
 
 def build_features(pairs: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
