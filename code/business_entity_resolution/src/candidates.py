@@ -5,6 +5,7 @@ from .blocking import (
     build_blocking_index,
     block_pairs_for_strategy,
     union_candidate_sets,
+    _merge_strategy,
 )
 from .normalize import normalize_columns
 
@@ -38,14 +39,24 @@ def generate_candidates_for_source(
     if strategies is None:
         strategies = DEFAULT_STRATEGIES
 
+    from .blocking import (
+        _exact_name_keydf, _country_norm_name_keydf,
+        _token_keydf, _address_keydf,
+    )
+    _builders = {
+        "exact_normalized_name":   _exact_name_keydf,
+        "country_normalized_name": _country_norm_name_keydf,
+        "country_name_tokens":     _token_keydf,
+        "country_address_number":  _address_keydf,
+    }
+
     candidate_dfs = []
     for strat in strategies:
-        target_index = build_blocking_index(target_df, key_strategy=strat)
-        strat_cands = block_pairs_for_strategy(
+        strat_cands = _merge_strategy(
             s1_df=s1_df,
-            target_index=target_index,
+            target_df=target_df,
             target_source=target_source,
-            key_strategy=strat,
+            strategy=strat,
             max_block_size=max_block_size,
         )
         candidate_dfs.append(strat_cands)
@@ -95,94 +106,138 @@ def generate_all_candidates(
     return union_candidate_sets([cands_s2, cands_s3])
 
 
+def enrich_candidate_pairs(
+    candidate_df: pd.DataFrame,
+    s1_df: pd.DataFrame,
+    s2_df: pd.DataFrame,
+    s3_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Enrich candidate pairs DataFrame with entity attributes from source DataFrames."""
+    if candidate_df.empty:
+        return candidate_df
+
+    # Combine S2 and S3 for fast lookup
+    target_df = pd.concat([s2_df, s3_df], ignore_index=True).drop_duplicates(subset=["entity_id"])
+
+    s1_sub = s1_df[["entity_id", "business_name", "business_address", "country"]].rename(
+        columns={
+            "entity_id": "source1_entity_id",
+            "business_name": "s1_business_name",
+            "business_address": "s1_business_address",
+            "country": "s1_country",
+        }
+    )
+
+    target_sub = target_df[["entity_id", "business_name", "business_address", "country"]].rename(
+        columns={
+            "entity_id": "candidate_entity_id",
+            "business_name": "candidate_business_name",
+            "business_address": "candidate_business_address",
+            "country": "candidate_country",
+        }
+    )
+
+    merged = candidate_df.merge(s1_sub, on="source1_entity_id", how="left")
+    enriched = merged.merge(target_sub, on="candidate_entity_id", how="left")
+    return enriched
+
+
+def attach_ground_truth_labels(
+    candidate_df: pd.DataFrame,
+    ground_truth_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Attach binary label column (1 = true match, 0 = candidate false match) to candidate pairs."""
+    if candidate_df.empty:
+        df = candidate_df.copy()
+        df["label"] = []
+        return df
+
+    true_pairs = set()
+    for _, row in ground_truth_df.iterrows():
+        s1_id = row["source1_entity_id"]
+        m_str = row["matched_entity_ids"]
+        if pd.notna(m_str) and str(m_str).strip():
+            for m_id in str(m_str).split(","):
+                m_id = m_id.strip()
+                if m_id:
+                    true_pairs.add((s1_id, m_id))
+
+    labels = [
+        1 if (s1, cand) in true_pairs else 0
+        for s1, cand in zip(candidate_df["source1_entity_id"], candidate_df["candidate_entity_id"])
+    ]
+
+    res = candidate_df.copy()
+    res["label"] = labels
+    return res
+
+
+
 def evaluate_candidate_recall(
     candidate_df: pd.DataFrame,
     ground_truth_df: pd.DataFrame,
 ) -> dict[str, float]:
-    """Measure candidate recall against training ground truth.
+    """Measure candidate recall against training ground truth (vectorized)."""
+    if candidate_df.empty:
+        return {
+            "candidate_recall_s2": 0.0, "candidate_recall_s3": 0.0,
+            "candidate_recall_overall": 0.0, "total_candidate_pairs": 0,
+            "true_pairs_s2_found": 0, "true_pairs_s2_total": 0,
+            "true_pairs_s3_found": 0, "true_pairs_s3_total": 0,
+            "avg_candidates_per_s1": 0.0,
+        }
 
-    Args:
-        candidate_df: DataFrame containing source1_entity_id and candidate_entity_id.
-        ground_truth_df: DataFrame containing source1_entity_id and matched_entity_ids.
+    # ── Build candidate pair sets from candidate_df ──────────────────────────
+    cands = candidate_df[["source1_entity_id", "candidate_entity_id"]].drop_duplicates()
+    cands_s2 = cands[cands["candidate_entity_id"].str.startswith("S2")]
+    cands_s3 = cands[cands["candidate_entity_id"].str.startswith("S3")]
 
-    Returns:
-        Dictionary of recall statistics for S2, S3, and combined overall match pairs.
-    """
-    s1_in_candidates = set(candidate_df["source1_entity_id"].unique()) if not candidate_df.empty else set()
-    
-    # Build candidate pairs sets
-    candidate_pairs_s2 = set()
-    candidate_pairs_s3 = set()
-    candidate_pairs_all = set()
+    # ── Build true pair sets from ground_truth_df (vectorized explode) ───────
+    s1_in_cands = set(cands["source1_entity_id"].unique())
+    gt_filtered = ground_truth_df[ground_truth_df["source1_entity_id"].isin(s1_in_cands)].copy()
+    gt_filtered = gt_filtered[gt_filtered["matched_entity_ids"].notna()]
+    gt_filtered = gt_filtered[gt_filtered["matched_entity_ids"].str.strip() != ""]
 
-    for _, row in candidate_df.iterrows():
-        s1_id = row["source1_entity_id"]
-        cand_id = row["candidate_entity_id"]
-        candidate_pairs_all.add((s1_id, cand_id))
-        if str(cand_id).startswith("S2"):
-            candidate_pairs_s2.add((s1_id, cand_id))
-        elif str(cand_id).startswith("S3"):
-            candidate_pairs_s3.add((s1_id, cand_id))
+    if gt_filtered.empty:
+        true_pairs = pd.DataFrame(columns=["source1_entity_id", "matched_entity_id"])
+    else:
+        gt_filtered = gt_filtered.copy()
+        gt_filtered["matched_entity_id"] = gt_filtered["matched_entity_ids"].str.split(",")
+        gt_exploded = gt_filtered.explode("matched_entity_id")
+        gt_exploded["matched_entity_id"] = gt_exploded["matched_entity_id"].str.strip()
+        true_pairs = gt_exploded[gt_exploded["matched_entity_id"] != ""][
+            ["source1_entity_id", "matched_entity_id"]
+        ].drop_duplicates()
 
-    # Build true ground truth pairs sets
-    true_pairs_s2 = set()
-    true_pairs_s3 = set()
-    true_pairs_all = set()
+    true_s2 = true_pairs[true_pairs["matched_entity_id"].str.startswith("S2")]
+    true_s3 = true_pairs[true_pairs["matched_entity_id"].str.startswith("S3")]
 
-    # Only evaluate for S1 entities present in ground truth
-    for _, row in ground_truth_df.iterrows():
-        s1_id = row["source1_entity_id"]
-        # If restricting to candidate evaluation subset
-        if s1_in_candidates and s1_id not in s1_in_candidates and len(s1_in_candidates) < len(ground_truth_df):
-            continue
-            
-        m_str = row["matched_entity_ids"]
-        if pd.isna(m_str) or not str(m_str).strip():
-            continue
+    # ── Compute recall via merge ──────────────────────────────────────────────
+    def _recall(cand: pd.DataFrame, truth: pd.DataFrame, cand_col: str, truth_col: str) -> tuple[int, int]:
+        if truth.empty:
+            return 0, 0
+        found = cand.merge(truth, left_on=["source1_entity_id", cand_col],
+                           right_on=["source1_entity_id", truth_col])
+        return len(found), len(truth)
 
-        for m_id in str(m_str).split(","):
-            m_id = m_id.strip()
-            if not m_id:
-                continue
-            true_pairs_all.add((s1_id, m_id))
-            if m_id.startswith("S2"):
-                true_pairs_s2.add((s1_id, m_id))
-            elif m_id.startswith("S3"):
-                true_pairs_s3.add((s1_id, m_id))
+    found_s2, total_s2 = _recall(cands_s2, true_s2, "candidate_entity_id", "matched_entity_id")
+    found_s3, total_s3 = _recall(cands_s3, true_s3, "candidate_entity_id", "matched_entity_id")
+    found_all = found_s2 + found_s3
+    total_all  = total_s2 + total_s3
 
-    # Compute recall
-    recall_s2 = (
-        len(candidate_pairs_s2 & true_pairs_s2) / len(true_pairs_s2)
-        if true_pairs_s2
-        else 0.0
-    )
-    recall_s3 = (
-        len(candidate_pairs_s3 & true_pairs_s3) / len(true_pairs_s3)
-        if true_pairs_s3
-        else 0.0
-    )
-    recall_overall = (
-        len(candidate_pairs_all & true_pairs_all) / len(true_pairs_all)
-        if true_pairs_all
-        else 0.0
-    )
-
-    num_s1_eval = len(s1_in_candidates) if s1_in_candidates else len(ground_truth_df)
-    avg_candidates_per_s1 = (
-        len(candidate_df) / num_s1_eval if num_s1_eval > 0 else 0.0
-    )
-
+    num_s1 = len(s1_in_cands) if s1_in_cands else len(ground_truth_df)
     return {
-        "candidate_recall_s2": recall_s2,
-        "candidate_recall_s3": recall_s3,
-        "candidate_recall_overall": recall_overall,
-        "total_candidate_pairs": len(candidate_df),
-        "true_pairs_s2_found": len(candidate_pairs_s2 & true_pairs_s2),
-        "true_pairs_s2_total": len(true_pairs_s2),
-        "true_pairs_s3_found": len(candidate_pairs_s3 & true_pairs_s3),
-        "true_pairs_s3_total": len(true_pairs_s3),
-        "avg_candidates_per_s1": avg_candidates_per_s1,
+        "candidate_recall_s2":      found_s2 / total_s2 if total_s2 else 0.0,
+        "candidate_recall_s3":      found_s3 / total_s3 if total_s3 else 0.0,
+        "candidate_recall_overall": found_all / total_all if total_all else 0.0,
+        "total_candidate_pairs":    len(candidate_df),
+        "true_pairs_s2_found":      found_s2,
+        "true_pairs_s2_total":      total_s2,
+        "true_pairs_s3_found":      found_s3,
+        "true_pairs_s3_total":      total_s3,
+        "avg_candidates_per_s1":    len(candidate_df) / num_s1 if num_s1 else 0.0,
     }
+
 
 
 def format_candidates_for_submission(
