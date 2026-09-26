@@ -4,8 +4,15 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
+
+try:
+    import lightgbm as lgb
+    HAS_LIGHTGBM = True
+except ImportError:
+    HAS_LIGHTGBM = False
 
 from .evaluate import evaluate_predictions, find_optimal_threshold
 from .features import FEATURE_COLUMNS, build_features, build_matching_features
@@ -98,10 +105,11 @@ def train_matching_model(
     model_path: Path | str | None = None,
     val_size: float = 0.2,
     random_state: int = 42,
-    class_weight: str | None = "balanced",
+    model_type: str = "gbdt",
     beta: float = 0.5,
+    **model_kwargs: Any,
 ) -> dict[str, Any]:
-    """Train a lightweight matching classifier and optimize probability threshold for F0.5.
+    """Train a Gradient Boosted Decision Tree (or baseline) and optimize probability threshold for F0.5.
 
     Args:
         train_pairs: Candidate pairs DataFrame with label column.
@@ -112,8 +120,10 @@ def train_matching_model(
         model_path: Optional path to save serialized model bundle.
         val_size: Fraction of source1 entities for validation if val_pairs is None.
         random_state: Random seed for reproducibility.
-        class_weight: Scikit-learn class weight for class imbalance (default 'balanced').
+        model_type: Classifier type: 'gbdt' (LightGBM/HistGBDT), 'lightgbm',
+                    'hist_gradient_boosting', or 'logistic_regression'.
         beta: Beta parameter for F-score optimization (default 0.5).
+        **model_kwargs: Additional parameters passed to the classifier.
 
     Returns:
         Dictionary containing trained model, best_threshold, metrics, and feature list.
@@ -137,16 +147,62 @@ def train_matching_model(
     X_val = build_matching_features(val_set, s1_df=s1_df, cand_df=cand_df)
     y_val = val_set[label_column].astype(int)
 
-    model = LogisticRegression(
-        C=1.0,
-        max_iter=1000,
-        class_weight=class_weight,
-        random_state=random_state,
-        solver="lbfgs",
-    )
-    model.fit(X_train[FEATURE_COLUMNS], y_train)
+    feature_cols = [c for c in FEATURE_COLUMNS if c in X_train.columns]
 
-    val_probs = model.predict_proba(X_val[FEATURE_COLUMNS])[:, 1]
+    # Calculate class imbalance weighting
+    n_pos = int(np.sum(y_train == 1))
+    n_neg = int(np.sum(y_train == 0))
+    scale_pos_weight = float(n_neg / n_pos) if n_pos > 0 else 1.0
+
+    model: Any = None
+    resolved_type = model_type.lower()
+
+    if resolved_type in ("gbdt", "lightgbm") and HAS_LIGHTGBM:
+        default_lgb_params = {
+            "n_estimators": 200,
+            "learning_rate": 0.05,
+            "num_leaves": 31,
+            "max_depth": 6,
+            "scale_pos_weight": scale_pos_weight,
+            "random_state": random_state,
+            "verbose": -1,
+            "n_jobs": -1,
+        }
+        default_lgb_params.update(model_kwargs)
+        model = lgb.LGBMClassifier(**default_lgb_params)
+        model.fit(
+            X_train[feature_cols],
+            y_train,
+            eval_set=[(X_val[feature_cols], y_val)],
+            callbacks=[lgb.early_stopping(stopping_rounds=20, verbose=False)],
+        )
+    elif resolved_type in ("gbdt", "hist_gradient_boosting"):
+        default_hgb_params = {
+            "max_iter": 200,
+            "learning_rate": 0.05,
+            "max_leaf_nodes": 31,
+            "class_weight": "balanced",
+            "random_state": random_state,
+            "early_stopping": True,
+        }
+        default_hgb_params.update(model_kwargs)
+        model = HistGradientBoostingClassifier(**default_hgb_params)
+        model.fit(X_train[feature_cols], y_train)
+    elif resolved_type == "logistic_regression":
+        default_lr_params = {
+            "C": 1.0,
+            "max_iter": 1000,
+            "class_weight": "balanced",
+            "random_state": random_state,
+            "solver": "lbfgs",
+        }
+        default_lr_params.update(model_kwargs)
+        model = LogisticRegression(**default_lr_params)
+        model.fit(X_train[feature_cols], y_train)
+    else:
+        raise ValueError(f"Unsupported model_type: {model_type}")
+
+    val_probs = model.predict_proba(X_val[feature_cols])[:, 1]
     best_th, best_f_beta, eval_table = find_optimal_threshold(y_val, val_probs, beta=beta)
 
     val_predictions = val_set.copy()
@@ -162,8 +218,9 @@ def train_matching_model(
 
     bundle: dict[str, Any] = {
         "model": model,
-        "fields": FEATURE_COLUMNS,
-        "feature_columns": FEATURE_COLUMNS,
+        "model_type": resolved_type,
+        "fields": feature_cols,
+        "feature_columns": feature_cols,
         "best_threshold": best_th,
         "best_f_beta": best_f_beta,
         "val_metrics": metrics,
@@ -185,7 +242,7 @@ def predict_matching_candidates(
     s1_df: pd.DataFrame | None = None,
     cand_df: pd.DataFrame | dict[str, pd.DataFrame] | list[pd.DataFrame] | None = None,
 ) -> pd.DataFrame:
-    """Generate predictions for candidate pairs.
+    """Generate predictions for candidate pairs using a trained model bundle.
 
     Returns:
         DataFrame containing:
@@ -205,6 +262,10 @@ def predict_matching_candidates(
     th = threshold if threshold is not None else bundle.get("best_threshold", 0.5)
 
     features = build_matching_features(pairs, s1_df=s1_df, cand_df=cand_df)
+    missing_cols = [c for c in feature_cols if c not in features.columns]
+    for c in missing_cols:
+        features[c] = 0.0
+
     probs = model.predict_proba(features[feature_cols])[:, 1]
 
     cand_source = (
@@ -231,6 +292,7 @@ def train_model(
     fields: list[str] | None = None,
     label_column: str = "label",
     model_path: Path | str | None = None,
+    model_type: str = "gbdt",
     **kwargs: Any,
 ) -> Any:
     """Train a matching model. Maintains backward compatibility with legacy pipelines."""
@@ -239,13 +301,21 @@ def train_model(
             train_pairs=pairs,
             label_column=label_column,
             model_path=model_path,
+            model_type=model_type,
             **kwargs,
         )
         return bundle["model"]
 
     # Legacy fallback for pairs with _left and _right columns
     features = build_features(pairs, columns=fields)
-    model = LogisticRegression(max_iter=1000, class_weight="balanced")
+    resolved_type = model_type.lower()
+    if resolved_type in ("gbdt", "lightgbm") and HAS_LIGHTGBM:
+        model = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.05, verbose=-1, random_state=42)
+    elif resolved_type in ("gbdt", "hist_gradient_boosting"):
+        model = HistGradientBoostingClassifier(max_iter=100, learning_rate=0.05, random_state=42)
+    else:
+        model = LogisticRegression(max_iter=1000, class_weight="balanced")
+
     model.fit(features, pairs[label_column].astype(int))
 
     bundle = {

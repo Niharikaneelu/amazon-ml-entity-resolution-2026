@@ -275,3 +275,25 @@ def test_train_and_predict_pipeline():
         assert len(preds) == len(test_pairs)
         assert ((preds["match_probability"] >= 0.0) & (preds["match_probability"] <= 1.0)).all()
         assert set(preds["match"].unique()).issubset({0, 1})
+
+
+def test_train_logistic_regression_fallback():
+    # Verify logistic regression can also still be trained explicitly
+    pairs_df = pd.DataFrame([
+        {"source1_entity_id": f"S1-{i}", "candidate_entity_id": f"S2-{i}", "candidate_source": "source2", "label": i % 2,
+         "business_name_s1": f"Acme {i}", "business_name_cand": f"Acme {i}" if i % 2 == 1 else "Different",
+         "business_address_s1": f"{100+i} Main St", "business_address_cand": f"{100+i} Main St",
+         "country_s1": "US", "country_cand": "US"}
+        for i in range(30)
+    ])
+
+    bundle = train_matching_model(
+        train_pairs=pairs_df,
+        model_type="logistic_regression",
+        val_size=0.3,
+        random_state=42,
+    )
+    assert bundle["model_type"] == "logistic_regression"
+    assert "best_threshold" in bundle
+    assert "model" in bundle
+

@@ -7,11 +7,12 @@ import pandas as pd
 
 try:
     from rapidfuzz import fuzz
+    from rapidfuzz.distance import JaroWinkler
     HAS_RAPIDFUZZ = True
 except ImportError:
     HAS_RAPIDFUZZ = False
 
-FEATURE_COLUMNS = [
+REQUIRED_FEATURES = [
     "name_exact",
     "name_similarity",
     "name_token_similarity",
@@ -23,6 +24,15 @@ FEATURE_COLUMNS = [
     "name_missing",
     "address_missing",
 ]
+
+EXTENDED_FEATURES = [
+    "name_jaro_winkler",
+    "name_token_jaccard",
+    "is_source2",
+    "is_source3",
+]
+
+FEATURE_COLUMNS = REQUIRED_FEATURES + EXTENDED_FEATURES
 
 
 def _clean_string(value: object) -> str:
@@ -41,8 +51,19 @@ def _string_similarity(s1: str, s2: str) -> float:
     if s1 == s2:
         return 1.0
     if HAS_RAPIDFUZZ:
-        return fuzz.ratio(s1, s2) / 100.0
-    return SequenceMatcher(None, s1, s2).ratio()
+        return float(fuzz.ratio(s1, s2) / 100.0)
+    return float(SequenceMatcher(None, s1, s2).ratio())
+
+
+def _jaro_winkler_similarity(s1: str, s2: str) -> float:
+    """Compute Jaro-Winkler string similarity between 0.0 and 1.0."""
+    if not s1 or not s2:
+        return 0.0
+    if s1 == s2:
+        return 1.0
+    if HAS_RAPIDFUZZ:
+        return float(JaroWinkler.similarity(s1, s2))
+    return float(SequenceMatcher(None, s1, s2).ratio())
 
 
 def _token_similarity(s1: str, s2: str) -> float:
@@ -52,8 +73,8 @@ def _token_similarity(s1: str, s2: str) -> float:
     if s1 == s2:
         return 1.0
     if HAS_RAPIDFUZZ:
-        return fuzz.token_sort_ratio(s1, s2) / 100.0
-    
+        return float(fuzz.token_sort_ratio(s1, s2) / 100.0)
+
     # Fallback to Jaccard similarity of alphanumeric tokens
     tokens1 = set(re.findall(r"\b[a-z0-9]+\b", s1))
     tokens2 = set(re.findall(r"\b[a-z0-9]+\b", s2))
@@ -61,7 +82,18 @@ def _token_similarity(s1: str, s2: str) -> float:
         return 0.0
     intersection = len(tokens1 & tokens2)
     union = len(tokens1 | tokens2)
-    return intersection / union if union > 0 else 0.0
+    return float(intersection / union) if union > 0 else 0.0
+
+
+def _token_jaccard(s1: str, s2: str) -> float:
+    """Compute Jaccard token similarity between two strings."""
+    if not s1 or not s2:
+        return 0.0
+    tok1 = set(re.findall(r"\b[a-z0-9]+\b", s1))
+    tok2 = set(re.findall(r"\b[a-z0-9]+\b", s2))
+    if not tok1 or not tok2:
+        return 0.0
+    return float(len(tok1 & tok2) / len(tok1 | tok2))
 
 
 def _extract_numbers(text: str) -> set[str]:
@@ -139,6 +171,10 @@ def build_matching_features(
         - house_number_match: 1.0 if address numbers match, else 0.0
         - name_missing: 1.0 if either name is missing/empty, else 0.0
         - address_missing: 1.0 if either address is missing/empty, else 0.0
+        - name_jaro_winkler: Jaro-Winkler similarity on business names
+        - name_token_jaccard: Jaccard word token overlap ratio
+        - is_source2: 1.0 if candidate is from Source 2, else 0.0
+        - is_source3: 1.0 if candidate is from Source 3, else 0.0
 
     Args:
         pairs: DataFrame containing pair identifiers or merged attributes.
@@ -192,6 +228,8 @@ def build_matching_features(
     name_sim = []
     name_tok_sim = []
     name_missing = []
+    name_jw = []
+    name_jaccard = []
 
     for n1, n2 in zip(names_1, names_2):
         is_missing = float(not n1 or not n2)
@@ -200,10 +238,14 @@ def build_matching_features(
             name_exact.append(0.0)
             name_sim.append(0.0)
             name_tok_sim.append(0.0)
+            name_jw.append(0.0)
+            name_jaccard.append(0.0)
         else:
             name_exact.append(float(n1 == n2))
             name_sim.append(_string_similarity(n1, n2))
             name_tok_sim.append(_token_similarity(n1, n2))
+            name_jw.append(_jaro_winkler_similarity(n1, n2))
+            name_jaccard.append(_token_jaccard(n1, n2))
 
     addr_exact = []
     addr_sim = []
@@ -234,6 +276,23 @@ def build_matching_features(
         else:
             country_match.append(float(c1 == c2))
 
+    # Candidate source features
+    is_source2 = []
+    is_source3 = []
+    if "candidate_source" in df.columns:
+        for s in df["candidate_source"]:
+            s_str = str(s).lower()
+            is_source2.append(float("source2" in s_str or "s2" in s_str))
+            is_source3.append(float("source3" in s_str or "s3" in s_str))
+    elif "candidate_entity_id" in df.columns:
+        for cid in df["candidate_entity_id"]:
+            cid_str = str(cid).upper()
+            is_source2.append(float(cid_str.startswith("S2")))
+            is_source3.append(float(cid_str.startswith("S3")))
+    else:
+        is_source2 = [0.0] * n_rows
+        is_source3 = [0.0] * n_rows
+
     features = pd.DataFrame(
         {
             "name_exact": name_exact,
@@ -246,6 +305,10 @@ def build_matching_features(
             "house_number_match": house_num_match,
             "name_missing": name_missing,
             "address_missing": addr_missing,
+            "name_jaro_winkler": name_jw,
+            "name_token_jaccard": name_jaccard,
+            "is_source2": is_source2,
+            "is_source3": is_source3,
         },
         index=pairs.index,
     )

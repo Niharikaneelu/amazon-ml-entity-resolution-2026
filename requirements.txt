@@ -4,3 +4,4 @@ scikit-learn
 rapidfuzz
 pyarrow
 tqdm
+lightgbm
