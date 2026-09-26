@@ -1,8 +1,8 @@
+from __future__ import annotations
 import pandas as pd
 
 from .blocking import (
     block_pairs,
-    build_blocking_index,
     block_pairs_for_strategy,
     union_candidate_sets,
 )
@@ -11,39 +11,30 @@ from .normalize import normalize_columns
 DEFAULT_STRATEGIES = [
     "exact_normalized_name",
     "country_normalized_name",
-    "country_name_tokens",
     "country_address_number",
 ]
 
 
+def precompute_target_indices(target_df: pd.DataFrame, strategies: list[str]) -> dict[str, pd.DataFrame]:
+    """Precompute all blocking keys for a target dataset to avoid rebuilding during chunks."""
+    from .blocking import get_keys_df
+    return {strat: get_keys_df(target_df, strat) for strat in strategies}
+
 def generate_candidates_for_source(
     s1_df: pd.DataFrame,
-    target_df: pd.DataFrame,
+    target_indices: dict[str, pd.DataFrame],
     target_source: str,
     strategies: list[str] | None = None,
     max_block_size: int = 5000,
 ) -> pd.DataFrame:
-    """Generate candidate pairs for S1 entities matching target source records.
-
-    Args:
-        s1_df: DataFrame of Source 1 records.
-        target_df: DataFrame of target records (Source 2 or Source 3).
-        target_source: Source identifier string ('source2' or 'source3').
-        strategies: List of blocking strategy names to apply and union.
-        max_block_size: Maximum allowed block size for candidate generation.
-
-    Returns:
-        DataFrame with columns: source1_entity_id, candidate_entity_id, candidate_source
-    """
     if strategies is None:
         strategies = DEFAULT_STRATEGIES
 
     candidate_dfs = []
     for strat in strategies:
-        target_index = build_blocking_index(target_df, key_strategy=strat)
         strat_cands = block_pairs_for_strategy(
             s1_df=s1_df,
-            target_index=target_index,
+            target_keys_df=target_indices[strat],
             target_source=target_source,
             key_strategy=strat,
             max_block_size=max_block_size,
@@ -52,33 +43,19 @@ def generate_candidates_for_source(
 
     return union_candidate_sets(candidate_dfs)
 
-
 def generate_all_candidates(
     s1_df: pd.DataFrame,
-    s2_df: pd.DataFrame,
-    s3_df: pd.DataFrame,
+    s2_indices: dict[str, pd.DataFrame],
+    s3_indices: dict[str, pd.DataFrame],
     strategies: list[str] | None = None,
     max_block_size: int = 5000,
 ) -> pd.DataFrame:
-    """Generate candidate pairs separately for S1 -> S2 and S1 -> S3 and union them.
-
-    Args:
-        s1_df: Source 1 DataFrame.
-        s2_df: Source 2 DataFrame.
-        s3_df: Source 3 DataFrame.
-        strategies: List of blocking strategies to apply.
-        max_block_size: Maximum allowed block size.
-
-    Returns:
-        Combined DataFrame matching required candidate schema:
-        source1_entity_id, candidate_entity_id, candidate_source
-    """
     if strategies is None:
         strategies = DEFAULT_STRATEGIES
 
     cands_s2 = generate_candidates_for_source(
         s1_df=s1_df,
-        target_df=s2_df,
+        target_indices=s2_indices,
         target_source="source2",
         strategies=strategies,
         max_block_size=max_block_size,
@@ -86,7 +63,7 @@ def generate_all_candidates(
 
     cands_s3 = generate_candidates_for_source(
         s1_df=s1_df,
-        target_df=s3_df,
+        target_indices=s3_indices,
         target_source="source3",
         strategies=strategies,
         max_block_size=max_block_size,
